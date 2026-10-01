@@ -586,7 +586,8 @@ public class ModuleGateway {
 		StringBuilder s = new StringBuilder();
 		s.append("// Recorded from an agent session: ").append(steps.size()).append(" successful runs, in order.\n");
 		s.append("// Every input is explicit, defaults included. Turn the values you want to vary into #@ parameters.\n");
-		s.append("#@ CommandService command\n#@ ScriptService scripts\n#@ ObjectService objects\n\n");
+		s.append("#@ CommandService command\n#@ ModuleService modules\n#@ ScriptService scripts\n#@ ObjectService objects\n\n");
+		s.append("// modules.run(command.getCommand(...)): command.run returns null for dynamic commands (a SciJava design flaw)\n");
 		s.append("def object = { Class type, String name -> objects.getObjects(type).find { objects.getName(it) == name || String.valueOf(it) == name } }\n\n");
 		Map<Object, String> producedBy = new IdentityHashMap<>();
 		for (int i = 0; i < steps.size(); i++) {
@@ -600,7 +601,7 @@ public class ModuleGateway {
 			String map = args.isEmpty() ? "[:]" : "[\n\t" + String.join(",\n\t", args) + "]";
 			s.append("// ").append(step.info.getTitle()).append('\n');
 			if (step.info instanceof CommandInfo) {
-				s.append("def ").append(var).append(" = command.run('").append(((CommandInfo) step.info).getClassName()).append("', true, ").append(map).append(").get()\n\n");
+				s.append("def ").append(var).append(" = modules.run(command.getCommand('").append(((CommandInfo) step.info).getClassName()).append("'), true, ").append(map).append(").get()\n\n");
 			}
 			else {
 				s.append("def ").append(var).append(" = scripts.run(new File(").append(quote(step.info.getIdentifier().replaceFirst("^script:", ""))).append("), true, ").append(map).append(").get()\n\n");
