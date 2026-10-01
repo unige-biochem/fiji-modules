@@ -73,7 +73,7 @@ import ch.unige.biochem.scijava.introspect.CommandIntrospector;
  */
 public class ModuleGateway {
 
-	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().serializeNulls().create();
 	/** Processors left out of agent runs: dialogs, remembered values, output windows. */
 	private static final String EXCLUDED_PROCESSORS = "(?i).*(Harvester|LoadInputs|SaveInputs|Display).*";
 	private static final int MAX_IMAGE_SIDE = 1024;
@@ -395,7 +395,7 @@ public class ModuleGateway {
 		for (ModuleItem<?> item : module.getInfo().outputs()) {
 			Object v = module.getOutput(item.getName());
 			if (v == null && "result".equals(item.getName()) && module instanceof ScriptModule) continue;
-			out.add(item.getName(), toJson(v, images));
+			out.add(item.getName(), v == null ? com.google.gson.JsonNull.INSTANCE : toJson(v, images)); // a null output is a signal
 		}
 		return out;
 	}
