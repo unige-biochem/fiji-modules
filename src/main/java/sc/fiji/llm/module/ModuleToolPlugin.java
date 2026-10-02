@@ -52,7 +52,8 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 			a -> text(gateway().search(a.get("query").getAsString(), 30)), "query");
 		add("fiji_module_describe",
 			"Describe a module's inputs and outputs (types, labels, descriptions, defaults and choices after its initializers ran), " +
-				"and the live objects that can fill its object inputs. id: a class name, menu path, title, or script file path.",
+				"the live objects that can fill its object inputs, and the artifact that provides it (provided_by: " +
+					"groupId:artifactId:version). id: a class name, menu path, title, or script file path.",
 			a -> text(gateway().describe(a.get("id").getAsString())), "id");
 		add("fiji_module_run",
 			"Run a module (command class, menu path, title, or the path of a script file) with inputs as a JSON object, e.g. " +

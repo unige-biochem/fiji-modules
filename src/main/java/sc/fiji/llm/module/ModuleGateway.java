@@ -56,6 +56,7 @@ import org.scijava.plugin.PluginService;
 import org.scijava.script.ScriptModule;
 import org.scijava.script.ScriptService;
 import org.scijava.service.Service;
+import org.scijava.util.POM;
 
 import ch.unige.biochem.scijava.introspect.CommandIntrospector;
 
@@ -150,6 +151,8 @@ public class ModuleGateway {
 		}
 		if (description == null) description = plainDescription(info);
 		description.addProperty("id", idOf(info));
+		String origin = origin(info);
+		if (origin != null) description.addProperty("provided_by", origin);
 		JsonObject candidates = new JsonObject();
 		for (ModuleItem<?> item : info.inputs()) {
 			if (isSimple(item.getType()) || isService(item.getType())) continue;
@@ -159,6 +162,18 @@ public class ModuleGateway {
 		}
 		if (candidates.size() > 0) description.add("live_objects", candidates);
 		return GSON.toJson(description);
+	}
+
+	/** groupId:artifactId:version of the jar a command comes from, so that an agent knows which version it is using. */
+	private String origin(ModuleInfo info) {
+		if (!(info instanceof CommandInfo)) return null;
+		try {
+			POM pom = POM.getPOM(((CommandInfo) info).loadClass());
+			return pom == null ? null : pom.getGroupId() + ":" + pom.getArtifactId() + ":" + pom.getVersion();
+		}
+		catch (Throwable t) {
+			return null;
+		}
 	}
 
 	private JsonObject plainDescription(ModuleInfo info) {
