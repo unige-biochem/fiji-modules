@@ -53,6 +53,7 @@ import org.scijava.module.process.PostprocessorPlugin;
 import org.scijava.module.process.PreprocessorPlugin;
 import org.scijava.object.ObjectService;
 import org.scijava.plugin.PluginService;
+import org.scijava.plugin.SingletonPlugin;
 import org.scijava.script.ScriptModule;
 import org.scijava.script.ScriptService;
 import org.scijava.service.Service;
@@ -207,18 +208,32 @@ public class ModuleGateway {
 
 	// -- objects --
 
-	/** The live objects, optionally of one type (simple or fully qualified class name). */
+	/**
+	 * The live objects of one type (simple or fully qualified class name), by name. Without a type, the number of
+	 * objects per type: a session can hold thousands of objects (image sources, for instance).
+	 */
 	public String objects(String type) {
+		boolean all = type == null || type.isEmpty();
 		JsonArray list = new JsonArray();
+		Map<String, Integer> counts = new LinkedHashMap<>();
 		for (Object o : objectService.getObjects(Object.class)) {
-			if (o == null || o instanceof Job) continue;
-			if (type != null && !type.isEmpty() && !isA(o.getClass(), type)) continue;
+			if (o == null || o instanceof Job || isInfrastructure(o)) continue;
+			if (all) { counts.merge(o.getClass().getSimpleName(), 1, Integer::sum); continue; }
+			if (!isA(o.getClass(), type)) continue;
 			JsonObject n = new JsonObject();
 			n.addProperty("name", nameOf(o));
 			n.addProperty("type", o.getClass().getSimpleName());
 			list.add(n);
 		}
-		return GSON.toJson(list);
+		return GSON.toJson(all ? GSON.toJsonTree(counts) : list);
+	}
+
+	/**
+	 * The ObjectService also holds the application's own parts: every singleton plugin (converters, formats, tools...)
+	 * and the desktop file types. A plugin that is not a singleton, such as an atlas command, is the user's.
+	 */
+	private static boolean isInfrastructure(Object o) {
+		return o instanceof SingletonPlugin || o.getClass().getName().equals("org.scijava.desktop.FileType");
 	}
 
 	// -- run --
@@ -515,7 +530,8 @@ public class ModuleGateway {
 
 	private String nameOf(Object o) {
 		String n = objectService.getName(o);
-		if (n != null) return n;
+		// Unnamed, the ObjectService gives toString(): class@hash for most objects, while they may have a name of their own
+		if (n != null && !n.equals(String.valueOf(o))) return n;
 		for (String getter : new String[] { "getName", "getTitle" }) {
 			try {
 				Object v = o.getClass().getMethod(getter).invoke(o);

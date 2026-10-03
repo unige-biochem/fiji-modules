@@ -69,7 +69,8 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 			a -> result(gateway().status(optional(a, "job", ""), Double.parseDouble(optional(a, "wait_seconds", "60")))),
 			"job", "wait_seconds");
 		add("fiji_objects",
-			"List the live objects Fiji holds (images, viewers, sessions...), optionally of one type, by the names module inputs accept.",
+			"The live objects Fiji holds (images, viewers, sessions...): without a type, the number of objects per type; with a " +
+				"type, the objects of that type by the names module inputs accept.",
 			a -> text(gateway().objects(optional(a, "type", ""))), "?type");
 		add("fiji_module_script",
 			"The successful fiji_module_run calls of this session as a Groovy script that replays them, every input explicit. " +
