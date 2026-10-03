@@ -322,7 +322,7 @@ public class ModuleGateway {
 		}
 		else {
 			json.addProperty("status", "ok");
-			if (module != null && !job.recorded) { steps.add(new Step(job.info, module)); job.recorded = true; }
+			if (module != null && !job.recorded && isRecorded(job.info)) { steps.add(new Step(job.info, module)); job.recorded = true; }
 		}
 		if (!job.bound.isEmpty()) json.add("bound", GSON.toJsonTree(job.bound));
 		if (module != null) json.add("outputs", outputs(module, images));
@@ -607,6 +607,15 @@ public class ModuleGateway {
 	}
 
 	// -- record --
+
+	/**
+	 * A module that only looks (a picture, a state) is left out of the recording by declaring the attribute
+	 * record=false: {@code #@script(record="false")} in a script, {@code @Attr(name = "record", value = "false")} on a
+	 * command.
+	 */
+	static boolean isRecorded(ModuleInfo info) {
+		return !"false".equalsIgnoreCase(info.get("record"));
+	}
 
 	/**
 	 * The successful runs so far, as a Groovy script that replays them: every input a module ran with,

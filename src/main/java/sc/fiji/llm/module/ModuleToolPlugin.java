@@ -73,7 +73,8 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 				"type, the objects of that type by the names module inputs accept.",
 			a -> text(gateway().objects(optional(a, "type", ""))), "?type");
 		add("fiji_module_script",
-			"The successful fiji_module_run calls of this session as a Groovy script that replays them, every input explicit. " +
+			"The successful fiji_module_run calls of this session as a Groovy script that replays them, every input explicit " +
+				"(modules declaring record=false, which only look, are left out). " +
 				"Once a result is right, save it (path) to keep the pipeline: edit it, turn values into #@ parameters, run it " +
 				"with fiji_module_run (its path is its id), or headless in a fresh Fiji.",
 			a -> {
