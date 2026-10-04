@@ -11,7 +11,7 @@ Fiji or as a one-shot pipeline step, and record a session as a replayable Groovy
 - `ModuleCLI`: one-shot run in a fresh JVM, for a jgo `module` entry point: prints one `MODULE_RESULT {json}`
   line, exits 0 or 1.
 
-Experimental (codename **sextant**). The package is `sc.fiji.llm.module` so that it can move into fiji-llm
+Experimental. The package is `sc.fiji.llm.module` so that it can move into fiji-llm
 unchanged. Depends on fiji-llm (not on Maven yet) and on scijava-introspect.
 
 Build: `mvn install` (needs fiji-llm `0.1.0-SNAPSHOT` installed locally).
