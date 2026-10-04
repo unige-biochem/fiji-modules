@@ -29,7 +29,7 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import sc.fiji.llm.tools.AiToolPlugin;
 
 /**
- * Exposes {@link ModuleGateway} as five MCP tools. Every SciJava command and script becomes
+ * Exposes {@link ModuleGateway} as six MCP tools. Every SciJava command and script becomes
  * reachable, so a plugin needs no tool of its own: its commands, with their descriptions, are its
  * tools.
  */
@@ -49,12 +49,14 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 		add("fiji_module_search",
 			"Find SciJava commands and scripts whose title, menu path, description or class contain all the words of the query. " +
 				"Every Fiji command and plugin is a module: search here before writing code.",
-			a -> text(gateway().search(a.get("query").getAsString(), 30)), "query");
+			a -> text(gateway().search(a.get("query").getAsString(), 30)),
+			"query: words that must all appear, e.g. 'gaussian blur'");
 		add("fiji_module_describe",
 			"Describe a module's inputs and outputs (types, labels, descriptions, defaults and choices after its initializers ran), " +
 				"the live objects that can fill its object inputs, and the artifact that provides it (provided_by: " +
 					"groupId:artifactId:version). id: a class name, menu path, title, or script file path.",
-			a -> text(gateway().describe(a.get("id").getAsString())), "id");
+			a -> text(gateway().describe(a.get("id").getAsString())),
+			"id: command title, menu path, class name, or script file path");
 		add("fiji_module_run",
 			"Run a module (command class, menu path, title, or the path of a script file) with inputs as a JSON object, e.g. " +
 				"{\"sigma\": 2, \"image\": \"blobs.gif\"}. Never opens the module's dialog: inputs not given keep their default; an " +
@@ -62,16 +64,20 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 				"(objects by name, pictures as images), new objects, and the warnings and errors logged meanwhile. Waits up to " +
 				"wait_seconds (default 60); a longer run returns a job id for fiji_module_status.",
 			a -> result(gateway().run(a.get("id").getAsString(), optional(a, "inputs", "{}"), Double.parseDouble(optional(a, "wait_seconds", "60")))),
-			"id", "inputs", "wait_seconds");
+			"id: command title, menu path, class name, or script file path",
+			"inputs: JSON object of input values by name, e.g. {\"sigma\": 2}; inputs not given keep their default",
+			"wait_seconds: seconds to wait before returning a job id instead (default 60)");
 		add("fiji_module_status",
 			"Follow a run started by fiji_module_run: waits up to wait_seconds (default 60) and returns its result, or 'running'. " +
 				"An empty job lists the runs.",
 			a -> result(gateway().status(optional(a, "job", ""), Double.parseDouble(optional(a, "wait_seconds", "60")))),
-			"job", "wait_seconds");
+			"job: the job id returned by fiji_module_run; empty lists the runs",
+			"wait_seconds: seconds to wait for the result (default 60)");
 		add("fiji_objects",
 			"The live objects Fiji holds (images, viewers, sessions...): without a type, the number of objects per type; with a " +
 				"type, the objects of that type by the names module inputs accept.",
-			a -> text(gateway().objects(optional(a, "type", ""))), "?type");
+			a -> text(gateway().objects(optional(a, "type", ""))),
+			"?type: simple or full class name, e.g. ImagePlus; empty counts the objects per type");
 		add("fiji_module_script",
 			"The successful fiji_module_run calls of this session as a Groovy script that replays them, every input explicit " +
 				"(modules declaring record=false, which only look, are left out). " +
@@ -84,7 +90,7 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 				try { java.nio.file.Files.write(java.nio.file.Paths.get(path), script.getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
 				catch (java.io.IOException e) { throw new IllegalArgumentException("Cannot write " + path + ": " + e.getMessage()); }
 				return text("{\"written\": " + new com.google.gson.Gson().toJson(path) + ", \"lines\": " + script.split("\n").length + "}");
-			}, "?path");
+			}, "?path: file to write the script to; empty returns it");
 		return tools;
 	}
 
@@ -94,13 +100,15 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 	}
 
 	/**
-	 * fiji-llm's MCP bridge names each property after its description, so both are the name.
-	 * The first parameter is required, unless its name starts with '?'.
+	 * Parameters are strings "name: description". The first one is required, unless its name starts with '?'.
 	 */
 	private void add(String name, String description, Function<JsonObject, ToolExecutionResult> body, String... params) {
 		JsonObjectSchema.Builder schema = JsonObjectSchema.builder();
-		for (String p : params) schema.addStringProperty(p.replace("?", ""), p.replace("?", ""));
-		if (!params[0].startsWith("?")) schema.required(params[0]);
+		for (String p : params) {
+			int colon = p.indexOf(':');
+			schema.addStringProperty(p.substring(0, colon).replace("?", ""), p.substring(colon + 1).trim());
+		}
+		if (!params[0].startsWith("?")) schema.required(params[0].substring(0, params[0].indexOf(':')));
 		ToolSpecification spec = ToolSpecification.builder().name(name).description(description).parameters(schema.build()).build();
 		ToolExecutor executor = new ToolExecutor() {
 			@Override
