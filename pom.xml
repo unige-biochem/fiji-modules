@@ -9,7 +9,7 @@
 	</parent>
 	<groupId>ch.unige.biochem</groupId>
 	<artifactId>fiji-modules</artifactId>
-	<version>0.1.1-SNAPSHOT</version>
+	<version>0.1.1</version>
 	<name>Fiji Modules</name>
 	<description>Search, describe and run any SciJava module (command or script) from an agent, headless or live.</description>
 	<url>https://github.com/unige-biochem/fiji-modules</url>
@@ -19,7 +19,7 @@
 	<developers><developer><id>nicokiaru</id><name>Nicolas Chiaruttini</name><roles><role>lead</role></roles></developer></developers>
 	<contributors><contributor><name>None</name></contributor></contributors>
 	<mailingLists><mailingList><name>Image.sc Forum</name><archive>https://forum.image.sc/tag/fiji</archive></mailingList></mailingLists>
-	<scm><connection>scm:git:https://github.com/unige-biochem/fiji-modules</connection><developerConnection>scm:git:git@github.com:unige-biochem/fiji-modules</developerConnection><tag>HEAD</tag><url>https://github.com/unige-biochem/fiji-modules</url></scm>
+	<scm><connection>scm:git:https://github.com/unige-biochem/fiji-modules</connection><developerConnection>scm:git:git@github.com:unige-biochem/fiji-modules</developerConnection><tag>fiji-modules-0.1.1</tag><url>https://github.com/unige-biochem/fiji-modules</url></scm>
 	<issueManagement><system>GitHub Issues</system><url>https://github.com/unige-biochem/fiji-modules/issues</url></issueManagement>
 	<ciManagement><system>None</system></ciManagement>
 	<properties>
