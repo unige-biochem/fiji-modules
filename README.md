@@ -1,3 +1,5 @@
+[![Build Status](https://github.com/unige-biochem/fiji-modules/actions/workflows/build.yml/badge.svg)](https://github.com/unige-biochem/fiji-modules/actions/workflows/build.yml)
+
 # fiji-modules
 
 Search, describe and run any SciJava module (a command or a `#@` script) on behalf of an agent, in a live
