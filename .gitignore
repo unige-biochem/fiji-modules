@@ -1,1 +1,13 @@
-target/
+# Maven
+/target/
+release.properties
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+
+# IDEs
+/.idea/
+*.iml
+/.settings/
+/.classpath
+/.project
+/.vscode/
