@@ -9,7 +9,7 @@
 	</parent>
 	<groupId>ch.unige.biochem</groupId>
 	<artifactId>fiji-modules</artifactId>
-	<version>0.1.2-SNAPSHOT</version>
+	<version>0.1.3-SNAPSHOT</version>
 	<name>Fiji Modules</name>
 	<description>Search, describe and run any SciJava module (command or script) from an agent, headless or live.</description>
 	<url>https://github.com/unige-biochem/fiji-modules</url>
