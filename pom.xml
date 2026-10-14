@@ -40,5 +40,7 @@
 		<dependency><groupId>com.google.code.gson</groupId><artifactId>gson</artifactId></dependency>
 		<dependency><groupId>ch.unige.biochem</groupId><artifactId>scijava-introspect</artifactId><version>0.2.0</version></dependency>
 		<dependency><groupId>sc.fiji</groupId><artifactId>fiji-llm</artifactId><version>0.1.0</version><scope>provided</scope></dependency>
+		<dependency><groupId>junit</groupId><artifactId>junit</artifactId><scope>test</scope></dependency>
+		<dependency><groupId>org.scijava</groupId><artifactId>scripting-groovy</artifactId><scope>test</scope></dependency>
 	</dependencies>
 </project>

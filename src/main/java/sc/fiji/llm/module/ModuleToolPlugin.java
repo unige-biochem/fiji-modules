@@ -54,7 +54,7 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import sc.fiji.llm.tools.AiToolPlugin;
 
 /**
- * Exposes {@link ModuleGateway} as six MCP tools. Every SciJava command and script becomes
+ * Exposes {@link ModuleGateway} as seven MCP tools. Every SciJava command and script becomes
  * reachable, so a plugin needs no tool of its own: its commands, with their descriptions, are its
  * tools.
  */
@@ -86,18 +86,35 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 			"Run a module (command class, menu path, title, or the path of a script file) with inputs as a JSON object, e.g. " +
 				"{\"sigma\": 2, \"image\": \"blobs.gif\"}. Never opens the module's dialog: inputs not given keep their default; an " +
 				"object input with one live instance is bound to it, else pass its name (see fiji_objects). Returns status, outputs " +
-				"(objects by name, pictures as images), new objects, and the warnings and errors logged meanwhile. Waits up to " +
-				"wait_seconds (default 60); a longer run returns a job id for fiji_module_status.",
-			a -> result(gateway().run(a.get("id").getAsString(), optional(a, "inputs", "{}"), Double.parseDouble(optional(a, "wait_seconds", "60")))),
+				"(objects by name, pictures as images), new objects, the modules it ran in turn (nested), and the warnings and " +
+				"errors it logged (messages). status is error when the module threw or reported success = false (error says why), " +
+				"canceled, or ok; ok with logged_errors (their number) and first_error means it ended normally but logged errors: " +
+				"check its outputs. Waits up to wait_seconds (default 30, at most 40: clients abort requests after about 60 s; " +
+				"follow a longer run with fiji_module_status). A run still going returns its job id, status running, and the " +
+				"titles of the modal dialogs open (dialogs); blocked_by_dialog means the job itself waits for a dialog.",
+			a -> result(gateway().run(a.get("id").getAsString(), optional(a, "inputs", "{}"), waitSeconds(a))),
 			"id: command title, menu path, class name, or script file path",
 			"inputs: JSON object of input values by name, e.g. {\"sigma\": 2}; inputs not given keep their default",
-			"wait_seconds: seconds to wait before returning a job id instead (default 60)");
+			"wait_seconds: " + WAIT);
+		add("fiji_module_run_script",
+			"Run a script given as text (Groovy by default) as fiji_module_run runs a script file: same inputs, result, job id " +
+				"and status, nothing written to disk. For what no command does: search the commands first. Declare what it needs " +
+				"with #@ lines, e.g. '#@ ImagePlus image' (an object input with one live instance is bound to it) or " +
+				"'#@ CommandService command', and what it returns with '#@output String result'. Recorded in fiji_module_script " +
+				"with its code; '#@script(record=\"false\")' leaves out a script that only looks.",
+			a -> result(gateway().runCode(a.get("code").getAsString(), optional(a, "language", "groovy"), optional(a, "inputs", "{}"), waitSeconds(a))),
+			"code: the script, with its #@ parameters",
+			"?language: groovy (default, recommended), or another language name or file extension; 'python' is Jython 2.7, " +
+				"not CPython: no numpy, no pip packages",
+			"?inputs: JSON object of input values by name, as for fiji_module_run",
+			"wait_seconds: " + WAIT);
 		add("fiji_module_status",
-			"Follow a run started by fiji_module_run: waits up to wait_seconds (default 60) and returns its result, or 'running'. " +
-				"An empty job lists the runs.",
-			a -> result(gateway().status(optional(a, "job", ""), Double.parseDouble(optional(a, "wait_seconds", "60")))),
-			"job: the job id returned by fiji_module_run; empty lists the runs",
-			"wait_seconds: seconds to wait for the result (default 60)");
+			"Follow a run started by fiji_module_run: waits up to wait_seconds and returns its result as fiji_module_run does, " +
+				"or status running (or blocked_by_dialog) with the dialogs open. An empty job lists the runs - title, status " +
+				"(running, ok, error or canceled) and seconds each, the last 20 finished ones kept - and the modal dialogs open.",
+			a -> result(gateway().status(optional(a, "job", ""), waitSeconds(a))),
+			"?job: the job id returned by fiji_module_run; empty lists the runs",
+			"wait_seconds: " + WAIT);
 		add("fiji_objects",
 			"The live objects Fiji holds (images, viewers, sessions...): without a type, the number of objects per type; with a " +
 				"type, the objects of that type by the names module inputs accept.",
@@ -154,6 +171,13 @@ public class ModuleToolPlugin extends AbstractRichPlugin implements AiToolPlugin
 			}
 		};
 		tools.put(spec, executor);
+	}
+
+	private static final String WAIT = "seconds to wait for the result before returning the job id (default 30, at most " +
+		ModuleGateway.MAX_WAIT_SECONDS + ": clients abort requests after about 60 s; follow a longer run with fiji_module_status)";
+
+	private static double waitSeconds(JsonObject a) {
+		return Math.min(Double.parseDouble(optional(a, "wait_seconds", "30")), ModuleGateway.MAX_WAIT_SECONDS);
 	}
 
 	private static String optional(JsonObject a, String key, String fallback) {

@@ -39,6 +39,7 @@ import java.awt.Window;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.PrintWriter;
+import java.io.StringReader;
 import java.io.StringWriter;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
@@ -49,21 +50,28 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import org.scijava.Cancelable;
 import org.scijava.Context;
+import org.scijava.Initializable;
 import org.scijava.ItemVisibility;
 import org.scijava.command.Command;
 import org.scijava.command.CommandInfo;
 import org.scijava.command.CommandService;
 import org.scijava.convert.ConvertService;
+import org.scijava.event.EventHandler;
+import org.scijava.event.EventService;
 import org.scijava.log.LogLevel;
 import org.scijava.log.LogListener;
 import org.scijava.log.LogMessage;
@@ -71,7 +79,13 @@ import org.scijava.log.LogService;
 import org.scijava.module.Module;
 import org.scijava.module.ModuleInfo;
 import org.scijava.module.ModuleItem;
+import org.scijava.module.ModuleRunner;
 import org.scijava.module.ModuleService;
+import org.scijava.module.event.ModuleCanceledEvent;
+import org.scijava.module.event.ModuleErroredEvent;
+import org.scijava.module.event.ModuleEvent;
+import org.scijava.module.event.ModuleFinishedEvent;
+import org.scijava.module.event.ModuleStartedEvent;
 import org.scijava.module.process.ModulePostprocessor;
 import org.scijava.module.process.ModulePreprocessor;
 import org.scijava.module.process.PostprocessorPlugin;
@@ -79,9 +93,12 @@ import org.scijava.module.process.PreprocessorPlugin;
 import org.scijava.object.ObjectService;
 import org.scijava.plugin.PluginService;
 import org.scijava.plugin.SingletonPlugin;
+import org.scijava.script.ScriptInfo;
+import org.scijava.script.ScriptLanguage;
 import org.scijava.script.ScriptModule;
 import org.scijava.script.ScriptService;
 import org.scijava.service.Service;
+import org.scijava.thread.ThreadService;
 import org.scijava.util.POM;
 
 import ch.unige.biochem.scijava.introspect.CommandIntrospector;
@@ -96,7 +113,8 @@ import ch.unige.biochem.scijava.introspect.CommandIntrospector;
  * the {@link ObjectService} - is bound to that instance; a required input with none of these is an
  * error. Object inputs and outputs are exchanged by name through the ObjectService, which is the
  * registry of live objects (sessions, images, viewers...). Errors carry their causes and the
- * warnings and errors logged while the module ran.
+ * warnings and errors the run logged: on its thread, on threads it started, or in tasks it gave
+ * the ThreadService - not what the rest of Fiji logged meanwhile.
  */
 public class ModuleGateway {
 
@@ -104,13 +122,21 @@ public class ModuleGateway {
 	/** Processors left out of agent runs: dialogs, remembered values, output windows. */
 	private static final String EXCLUDED_PROCESSORS = "(?i).*(Harvester|LoadInputs|SaveInputs|Display).*";
 	private static final int MAX_IMAGE_SIDE = 1024;
+	/** MCP clients abort a request after about 60 s: a longer run is followed with {@link #status}. */
+	public static final int MAX_WAIT_SECONDS = 40;
+	/** Finished runs kept for {@link #status}; older ones are dropped, with their modules. */
+	private static final int KEPT_JOBS = 20;
 
 	private final Context context;
 	private final ModuleService moduleService;
 	private final ObjectService objectService;
 	private final ConvertService convertService;
 	private final LogService logService;
-	private final Map<String, Job> jobs = new ConcurrentHashMap<>();
+	private final ThreadService threadService;
+	private final Map<String, Job> jobs = Collections.synchronizedMap(new LinkedHashMap<>());
+	/** The job a thread runs for, inherited by the threads it starts. */
+	private final InheritableThreadLocal<Job> jobMarker = new InheritableThreadLocal<>();
+	private final Map<Thread, Job> jobThreads = new ConcurrentHashMap<>();
 
 	public ModuleGateway(Context context) {
 		this.context = context;
@@ -118,6 +144,12 @@ public class ModuleGateway {
 		this.objectService = context.getService(ObjectService.class);
 		this.convertService = context.getService(ConvertService.class);
 		this.logService = context.getService(LogService.class);
+		this.threadService = context.getService(ThreadService.class);
+		logService.addLogListener(message -> {
+			Job job = currentJob();
+			if (job != null) job.messageLogged(message);
+		});
+		context.getService(EventService.class).subscribe(this);
 	}
 
 	/** The result of a run: JSON for the agent, plus the images it produced. */
@@ -265,35 +297,97 @@ public class ModuleGateway {
 
 	/**
 	 * Runs a module with JSON inputs, and waits for it up to {@code waitSeconds}. A run still going
-	 * after that - or stopped by a dialog - is reported with a job id, to follow with {@link #status}.
+	 * after that - or waiting for a dialog - is reported with a job id, to follow with {@link #status}.
 	 */
 	public Result run(String id, String inputsJson, double waitSeconds) {
+		return start(() -> resolve(id), inputsJson, waitSeconds);
+	}
+
+	/**
+	 * Runs a script given as text, as {@link #run} runs a script file: its {@code #@} parameters are its inputs and
+	 * outputs. Nothing is written to disk: {@link #script} replays it with its code.
+	 */
+	public Result runCode(String code, String language, String inputsJson, double waitSeconds) {
+		return start(() -> codeInfo(code, language), inputsJson, waitSeconds);
+	}
+
+	private Result start(Supplier<ModuleInfo> resolver, String inputsJson, double waitSeconds) {
 		Job job = new Job();
 		try {
-			ModuleInfo info = resolve(id);
+			ModuleInfo info = resolver.get();
 			job.info = info;
 			Module module = moduleService.createModule(info);
+			job.module = module;
 			if (module instanceof ScriptModule) ((ScriptModule) module).setErrorWriter(job.scriptErrors);
-			Map<String, Object> inputs = bindInputs(module, inputsJson == null || inputsJson.isBlank() ? new JsonObject() : JsonParser.parseString(inputsJson).getAsJsonObject(), job);
+			bindInputs(module, inputsJson == null || inputsJson.isBlank() ? new JsonObject() : JsonParser.parseString(inputsJson).getAsJsonObject(), job);
 			job.objectsBefore = identitySet(objectService.getObjects(Object.class));
-			job.dialogsBefore = identitySet(java.util.Arrays.asList((Object[]) Window.getWindows()));
-			logService.addLogListener(job);
+			ModuleRunner runner = new ModuleRunner(context, module, this.<ModulePreprocessor>processors(PreprocessorPlugin.class), this.<ModulePostprocessor>processors(PostprocessorPlugin.class));
 			job.started = System.currentTimeMillis();
-			job.future = moduleService.run(module, this.<ModulePreprocessor>processors(PreprocessorPlugin.class), this.<ModulePostprocessor>processors(PostprocessorPlugin.class), inputs);
+			job.future = threadService.run(() -> runAs(job, runner));
 		}
 		catch (Throwable t) {
 			job.failure = t;
 		}
 		job.id = UUID.randomUUID().toString().substring(0, 8);
-		jobs.put(job.id, job);
+		keep(job);
 		return await(job, waitSeconds);
 	}
 
-	/** Follows a run started by {@link #run}; an empty id lists the runs. */
+	/** Runs a module on the current thread, marked as the job's: what it logs and the modules it runs belong to the job. */
+	private Module runAs(Job job, ModuleRunner runner) {
+		job.thread = Thread.currentThread();
+		jobThreads.put(job.thread, job);
+		jobMarker.set(job);
+		try { return runner.call(); }
+		finally {
+			jobMarker.remove();
+			jobThreads.remove(job.thread);
+			job.ended = System.currentTimeMillis();
+		}
+	}
+
+	/**
+	 * The running job the current thread works for: its own thread, a thread it started, or a task it gave the
+	 * ThreadService, such as a command it runs. A thread the job started keeps the marker after the job ended.
+	 */
+	private Job currentJob() {
+		Job job = jobMarker.get();
+		if (job != null && job.ended == 0) return job;
+		Thread t = Thread.currentThread();
+		for (int depth = 0; t != null && depth < 20; depth++, t = threadService.getParent(t)) {
+			job = jobThreads.get(t);
+			if (job != null) return job;
+		}
+		return null;
+	}
+
+	/** Keeps a job, and the last finished ones only: each holds its module, with its inputs and outputs. */
+	private void keep(Job job) {
+		synchronized (jobs) {
+			jobs.put(job.id, job);
+			List<String> finished = new ArrayList<>();
+			jobs.forEach((id, j) -> { if (!j.running()) finished.add(id); });
+			for (String id : finished.subList(0, Math.max(0, finished.size() - KEPT_JOBS))) jobs.remove(id);
+		}
+	}
+
+	/** Follows a run started by {@link #run}; an empty id lists the runs, and the dialogs open. */
 	public Result status(String jobId, double waitSeconds) {
 		if (jobId == null || jobId.isEmpty()) {
 			JsonObject all = new JsonObject();
-			jobs.forEach((k, j) -> all.addProperty(k, j.future == null ? "error" : j.future.isDone() ? "done" : "running"));
+			JsonArray dialogs = openDialogs();
+			if (dialogs.size() > 0) all.add("dialogs", dialogs);
+			JsonObject runs = new JsonObject();
+			synchronized (jobs) {
+				jobs.forEach((k, j) -> {
+					JsonObject run = new JsonObject();
+					run.addProperty("title", j.info == null ? null : j.info.getTitle());
+					run.addProperty("status", j.running() ? "running" : j.outcome());
+					run.addProperty("seconds", j.seconds());
+					runs.add(k, run);
+				});
+			}
+			all.add("jobs", runs);
 			return new Result(all, Collections.emptyList());
 		}
 		Job job = jobs.get(jobId);
@@ -305,52 +399,48 @@ public class ModuleGateway {
 		long deadline = System.currentTimeMillis() + (long) (Math.min(waitSeconds, 1e9) * 1000);
 		JsonObject json = new JsonObject();
 		json.addProperty("job", job.id);
-		List<BufferedImage> images = new ArrayList<>();
-		if (job.future != null && job.failure == null) {
-			Window seen = null;
-			long seenSince = 0;
-			while (!job.future.isDone()) {
-				Window dialog = newModalDialog(job.dialogsBefore);
-				if (dialog != seen) { seen = dialog; seenSince = System.currentTimeMillis(); }
-				if (dialog != null && System.currentTimeMillis() - seenSince > 3000) { // progress dialogs come and go
-					json.addProperty("status", "blocked_by_dialog");
-					json.addProperty("dialog", ((Dialog) dialog).getTitle());
-					json.addProperty("hint", "An input was not given to a command the module runs: answer the dialog, or pass that input");
-					return new Result(json, images);
+		long blockedSince = 0;
+		while (job.running()) {
+			long now = System.currentTimeMillis();
+			blockedSince = !waitsForDialog(job) ? 0 : blockedSince == 0 ? now : blockedSince;
+			boolean blocked = blockedSince > 0 && now - blockedSince > 3000; // progress dialogs come and go
+			if (blocked || now > deadline) {
+				JsonArray dialogs = openDialogs();
+				json.addProperty("status", blocked ? "blocked_by_dialog" : "running");
+				json.addProperty("seconds", job.seconds());
+				if (blocked && dialogs.size() > 0) {
+					json.add("dialog", dialogs.get(dialogs.size() - 1)); // the newest
+					json.addProperty("hint", "The job waits for this dialog: read it with fiji_ui_dialogs_read; answer only if the user asks");
 				}
-				if (System.currentTimeMillis() > deadline) {
-					json.addProperty("status", "running");
-					json.addProperty("seconds", (System.currentTimeMillis() - job.started) / 1000);
-					return new Result(json, images);
-				}
-				try { job.future.get(200, TimeUnit.MILLISECONDS); }
-				catch (TimeoutException e) { /* keep waiting */ }
-				catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-				catch (ExecutionException e) { job.failure = e.getCause(); }
+				if (dialogs.size() > 0) json.add("dialogs", dialogs);
+				if (!job.nested.isEmpty()) json.add("nested", job.nestedRuns());
+				return new Result(json, Collections.emptyList());
 			}
+			try { job.future.get(200, TimeUnit.MILLISECONDS); }
+			catch (TimeoutException | ExecutionException | CancellationException e) { /* keep waiting, or read below */ }
+			catch (InterruptedException e) { Thread.currentThread().interrupt(); deadline = 0; }
 		}
-		logService.removeLogListener(job);
-		Module module = null;
-		if (job.future != null && job.failure == null) {
-			try { module = job.future.get(); }
-			catch (Throwable t) { job.failure = t instanceof ExecutionException ? t.getCause() : t; }
-		}
+		List<BufferedImage> images = new ArrayList<>();
+		String status = job.outcome();
+		json.addProperty("status", status);
 		String scriptErrors = job.scriptErrors.toString().trim();
-		if (job.failure != null || !scriptErrors.isEmpty()) {
-			json.addProperty("status", "error");
-			json.addProperty("error", job.failure != null ? causes(job.failure) : firstLines(scriptErrors, 12));
+		if (status.equals("error")) {
+			json.addProperty("error", job.failure != null ? causes(job.failure) : !scriptErrors.isEmpty() ? firstLines(scriptErrors, 12) : errorOutput(job.module));
 		}
-		else if (module instanceof Cancelable && ((Cancelable) module).isCanceled()) {
-			json.addProperty("status", "canceled");
-			String reason = ((Cancelable) module).getCancelReason();
+		else if (status.equals("canceled")) {
+			String reason = ((Cancelable) job.module).getCancelReason();
 			if (reason != null) json.addProperty("reason", reason);
 		}
 		else {
-			json.addProperty("status", "ok");
-			if (module != null && !job.recorded && isRecorded(job.info)) { steps.add(new Step(job.info, module)); job.recorded = true; }
+			if (job.errors > 0) { // ended normally, yet something went wrong on the way
+				json.addProperty("logged_errors", job.errors);
+				json.addProperty("first_error", job.firstError);
+			}
+			if (!job.recorded && isRecorded(job.info)) { steps.add(new Step(job.info, job.module)); job.recorded = true; }
 		}
 		if (!job.bound.isEmpty()) json.add("bound", GSON.toJsonTree(job.bound));
-		if (module != null) json.add("outputs", outputs(module, images));
+		if (!job.nested.isEmpty()) json.add("nested", job.nestedRuns());
+		if (job.module != null && job.failure == null) json.add("outputs", outputs(job.module, images));
 		if (job.objectsBefore != null) {
 			Map<String, List<String>> created = new LinkedHashMap<>();
 			for (Object o : objectService.getObjects(Object.class)) {
@@ -364,31 +454,73 @@ public class ModuleGateway {
 			}
 		}
 		if (!job.messages.isEmpty()) json.add("messages", GSON.toJsonTree(new ArrayList<>(job.messages)));
-		if (job.started > 0) json.addProperty("seconds", (System.currentTimeMillis() - job.started) / 1000.0);
+		if (job.started > 0) json.addProperty("seconds", job.seconds());
+		JsonArray dialogs = openDialogs(); // an error shown in a modal dialog blocks the window until it is closed
+		if (dialogs.size() > 0) {
+			json.add("dialogs", dialogs);
+			json.addProperty("hint", "Modal dialogs are open: read them (fiji_ui_dialogs_read); one the run showed blocks the window until closed");
+		}
 		return new Result(json, images);
+	}
+
+	/** A module may report its failure in outputs rather than throw: success = false, the reason in error (biop-tools). */
+	static boolean reportsFailure(Module module) {
+		return module != null && module.getInfo().getOutput("success") != null && Boolean.FALSE.equals(module.getOutput("success"));
+	}
+
+	private static String errorOutput(Module module) {
+		Object error = module.getInfo().getOutput("error") == null ? null : module.getOutput("error");
+		return error == null || error.toString().isBlank() ? "The module reported success = false" : error.toString();
+	}
+
+	// -- nested runs: the modules a job runs in turn, such as a command calling another one --
+
+	@EventHandler
+	private void onEvent(ModuleStartedEvent e) {
+		Job job = currentJob();
+		if (job != null && e.getModule() != job.module && job.nested.size() < 20) job.nested.put(e.getModule(), "running");
+	}
+
+	@EventHandler
+	private void onEvent(ModuleFinishedEvent e) { nestedEnded(e, reportsFailure(e.getModule()) ? "error" : "ok"); }
+
+	@EventHandler
+	private void onEvent(ModuleCanceledEvent e) { nestedEnded(e, "canceled"); }
+
+	@EventHandler
+	private void onEvent(ModuleErroredEvent e) { nestedEnded(e, "error"); }
+
+	private void nestedEnded(ModuleEvent e, String status) {
+		Job job = currentJob();
+		if (job != null) job.nested.replace(e.getModule(), status);
 	}
 
 	// -- inputs --
 
-	private Map<String, Object> bindInputs(Module module, JsonObject given, Job job) {
+	private void bindInputs(Module module, JsonObject given, Job job) {
 		ModuleInfo info = module.getInfo();
-		Map<String, Object> inputs = new LinkedHashMap<>();
 		Set<String> known = new LinkedHashSet<>();
 		for (ModuleItem<?> item : info.inputs()) if (!isService(item.getType())) known.add(item.getName());
 		for (String name : given.keySet()) {
-			if (!known.contains(name)) throw new IllegalArgumentException("Unknown input '" + name + "'. Inputs: " + known);
+			if (!known.contains(name)) throw new IllegalArgumentException("Unknown input '" + name + "'. Inputs: " + known
+				+ (module instanceof ScriptModule ? ". A #@ line whose class is not found is dropped: give the full class name (#@ lines ignore imports)" : ""));
 			ModuleItem<?> item = info.getInput(name);
+			if (item.getType().getName().equals("org.scijava.widget.Button")) {
+				throw new IllegalArgumentException("'" + name + "' is a button of the module's dialog, which only fills other inputs: "
+					+ "leave it out and give those inputs");
+			}
 			Object value = toJava(given.get(name), item.getType(), name);
 			List<?> choices = item.getChoices();
 			if (value != null && choices != null && !choices.isEmpty() && !choices.contains(value)) {
 				throw new IllegalArgumentException("Input '" + name + "': " + value + " is not one of " + choices);
 			}
-			inputs.put(name, value);
+			module.setInput(name, value);
+			module.resolveInput(name);
 		}
 		List<String> missing = new ArrayList<>();
 		for (ModuleItem<?> item : info.inputs()) {
 			String name = item.getName();
-			if (inputs.containsKey(name) || isService(item.getType())) continue;
+			if (given.has(name) || isService(item.getType())) continue;
 			if (item.getVisibility() == ItemVisibility.MESSAGE) { module.resolveInput(name); continue; }
 			Object current = module.getInput(name);
 			if (current == null && item.getDefaultValue() != null) current = item.getDefaultValue();
@@ -397,7 +529,7 @@ public class ModuleGateway {
 				List<?> live = liveObjects(item.getType());
 				if (live.size() == 1) { current = live.get(0); job.bound.put(name, nameOf(current)); }
 			}
-			if (current == null && item.isRequired() && !item.getType().isPrimitive() && item.getType() != String.class) {
+			if (current == null && item.isRequired() && !item.getType().isPrimitive() && (item.getType() != String.class || !mayBeInitialized(module, item))) {
 				missing.add(name + " (" + item.getType().getSimpleName() + ")");
 				continue;
 			}
@@ -405,8 +537,14 @@ public class ModuleGateway {
 			module.resolveInput(name);
 		}
 		if (!missing.isEmpty()) throw new IllegalArgumentException("Missing required input(s): " + String.join(", ", missing));
-		return inputs;
 	}
+
+	/** An initializer - the input's or the module's - may give a String input its value when the module runs. */
+	private static boolean mayBeInitialized(Module module, ModuleItem<?> item) {
+		return !isBlank(item.getInitializer()) || !isBlank(module.getInfo().getInitializer()) || module.getDelegateObject() instanceof Initializable;
+	}
+
+	private static boolean isBlank(String s) { return s == null || s.isBlank(); }
 
 	private Object toJava(JsonElement value, Class<?> type, String name) {
 		if (value == null || value.isJsonNull()) return null;
@@ -524,9 +662,32 @@ public class ModuleGateway {
 			String menu = info.getMenuPath() == null ? "" : info.getMenuPath().toString();
 			if (key.equals(menu) || key.equalsIgnoreCase(info.getTitle())) byTitle.add(info);
 		}
+		// The Window menu lists the open windows, a command's output window included, by their title
+		if (byTitle.size() > 1) byTitle.removeIf(info -> "net.imagej.display.SelectWindow".equals(info.getDelegateClassName()));
 		if (byTitle.size() == 1) return byTitle.get(0);
 		if (byTitle.size() > 1) throw new IllegalArgumentException(byTitle.size() + " modules are called '" + key + "': use a class name");
 		throw new IllegalArgumentException("No module '" + key + "': search for it first");
+	}
+
+	/** The code of the scripts given as text, for {@link #script}. */
+	private final Map<ModuleInfo, String> codes = Collections.synchronizedMap(new IdentityHashMap<>());
+	private final AtomicInteger codeRuns = new AtomicInteger();
+
+	/** A script given as text, named code_N.<extension of its language>: the name sets the language. */
+	private ModuleInfo codeInfo(String code, String language) {
+		if (code == null || code.isBlank()) throw new IllegalArgumentException("No code");
+		ScriptService scripts = context.getService(ScriptService.class);
+		String name = language == null || language.isBlank() ? "groovy" : language.trim().replaceFirst("^\\.", "");
+		ScriptLanguage lang = scripts.getLanguageByName(name);
+		if (lang == null) lang = scripts.getLanguageByExtension(name);
+		if (lang == null) {
+			List<String> known = new ArrayList<>();
+			for (ScriptLanguage l : scripts.getLanguages()) known.add(l.getLanguageName() + " (" + String.join(", ", l.getExtensions()) + ")");
+			throw new IllegalArgumentException("No script language '" + name + "': " + String.join("; ", known));
+		}
+		ScriptInfo info = new ScriptInfo(context, "code_" + codeRuns.incrementAndGet() + "." + lang.getExtensions().get(0), new StringReader(code));
+		codes.put(info, code);
+		return info;
 	}
 
 	private String idOf(ModuleInfo info) {
@@ -594,12 +755,23 @@ public class ModuleGateway {
 		return s;
 	}
 
-	/** The modal dialogs opened since a run started: a command waiting for an input it was not given. */
-	private static Window newModalDialog(Set<Object> before) {
+	/** The titles of the modal dialogs on screen, whoever opened them, oldest first. */
+	private static JsonArray openDialogs() {
+		JsonArray titles = new JsonArray();
 		for (Window w : Window.getWindows()) {
-			if (w instanceof Dialog && w.isShowing() && ((Dialog) w).isModal() && (before == null || !before.contains(w))) return w;
+			if (w instanceof Dialog && w.isShowing() && ((Dialog) w).isModal()) titles.add(Objects.toString(((Dialog) w).getTitle(), ""));
 		}
-		return null;
+		return titles;
+	}
+
+	/** Whether the job's thread waits for a modal dialog: one it shows, or one shown by the code it waits for on the event dispatch thread. */
+	private static boolean waitsForDialog(Job job) {
+		if (job.thread == null) return false;
+		for (StackTraceElement f : job.thread.getStackTrace()) {
+			boolean shows = f.getClassName().equals("java.awt.Dialog") && f.getMethodName().equals("show");
+			if (shows || f.getClassName().equals("java.awt.EventQueue") && f.getMethodName().equals("invokeAndWait")) return openDialogs().size() > 0;
+		}
+		return false;
 	}
 
 	/** Every distinct message down the cause chain: the useful one is rarely on top. */
@@ -619,9 +791,17 @@ public class ModuleGateway {
 		return t;
 	}
 
+	/** The first n lines of a stack trace, and each 'Caused by' with the line below it: the useful one is rarely on top. */
 	private static String firstLines(String s, int n) {
 		String[] lines = s.split("\\R");
-		return String.join("\n", java.util.Arrays.copyOf(lines, Math.min(n, lines.length)));
+		List<String> kept = new ArrayList<>(java.util.Arrays.asList(lines).subList(0, Math.min(n, lines.length)));
+		for (int i = n; i < lines.length; i++) {
+			if (lines[i].startsWith("Caused by")) {
+				kept.add(lines[i]);
+				if (i + 1 < lines.length) kept.add(lines[i + 1]);
+			}
+		}
+		return String.join("\n", kept);
 	}
 
 	private static String firstSentence(String s) {
@@ -667,6 +847,12 @@ public class ModuleGateway {
 			s.append("// ").append(step.info.getTitle()).append('\n');
 			if (step.info instanceof CommandInfo) {
 				s.append("def ").append(var).append(" = modules.run(command.getCommand('").append(((CommandInfo) step.info).getClassName()).append("'), true, ").append(map).append(").get()\n\n");
+			}
+			else if (codes.containsKey(step.info)) { // a script given as text: replayed with its code
+				String name = step.info.getIdentifier().replaceFirst("^script:", "");
+				s.append("def ").append(var).append(" = scripts.run(").append(quote(name)).append(", '''")
+					.append(codes.get(step.info).replace("\\", "\\\\").replace("'''", "\\'\\'\\'"))
+					.append("''', true, ").append(map).append(").get()\n\n");
 			}
 			else {
 				s.append("def ").append(var).append(" = scripts.run(new File(").append(quote(step.info.getIdentifier().replaceFirst("^script:", ""))).append("), true, ").append(map).append(").get()\n\n");
@@ -719,26 +905,65 @@ public class ModuleGateway {
 		}
 	}
 
-	/** One run: its future, and what it logged meanwhile. */
+	/** One run: its future, its thread, and what it logged and ran meanwhile. */
 	private static class Job implements LogListener {
 		ModuleInfo info;
+		Module module;
 		boolean recorded;
 		String id;
 		Future<Module> future;
+		volatile Thread thread;
 		Throwable failure;
 		long started;
+		volatile long ended;
 		Set<Object> objectsBefore;
-		Set<Object> dialogsBefore;
 		final StringWriter scriptErrors = new StringWriter();
 		final Map<String, String> bound = new LinkedHashMap<>();
 		final Set<String> messages = Collections.synchronizedSet(new LinkedHashSet<>());
+		int errors;
+		String firstError;
+		/** The modules the job ran in turn, with how each ended. */
+		final Map<Module, String> nested = Collections.synchronizedMap(new LinkedHashMap<>());
+
+		boolean running() { return future != null && !future.isDone(); }
+
+		double seconds() {
+			return started == 0 ? 0 : Math.round(((ended > 0 ? ended : System.currentTimeMillis()) - started) / 100.0) / 10.0;
+		}
+
+		/** What a finished run came to: error (it threw, or reported success = false), canceled, or ok. */
+		String outcome() {
+			if (future != null && failure == null) {
+				try { future.get(); }
+				catch (ExecutionException e) { failure = e.getCause(); }
+				catch (Throwable t) { failure = t; }
+			}
+			if (failure != null || !scriptErrors.toString().isBlank()) return "error";
+			if (module instanceof Cancelable && ((Cancelable) module).isCanceled()) return "canceled";
+			return reportsFailure(module) ? "error" : "ok";
+		}
+
+		JsonArray nestedRuns() {
+			JsonArray runs = new JsonArray();
+			synchronized (nested) {
+				nested.forEach((m, status) -> {
+					JsonObject run = new JsonObject();
+					run.addProperty("title", m.getInfo().getTitle());
+					run.addProperty("status", status);
+					runs.add(run);
+				});
+			}
+			return runs;
+		}
 
 		@Override
-		public void messageLogged(LogMessage message) {
-			if (message.level() > LogLevel.WARN || messages.size() >= 20) return;
+		public synchronized void messageLogged(LogMessage message) {
+			if (message.level() > LogLevel.WARN) return;
 			String text = LogLevel.prefix(message.level()) + " " + message.text();
 			if (message.throwable() != null) text += " <- " + causes(message.throwable()).replace('\n', ' ');
-			messages.add(text.length() > 600 ? text.substring(0, 600) + "..." : text);
+			text = text.length() > 600 ? text.substring(0, 600) + "..." : text;
+			if (message.level() == LogLevel.ERROR && errors++ == 0) firstError = text;
+			if (messages.size() < 20) messages.add(text);
 		}
 	}
 
